@@ -149,169 +149,14 @@ class MoEFFN(nn.Module):
 
         return y, balance_loss
 
-
-# -----------------------------
-# Tiny Transformer with MoE in FFN
-# -----------------------------
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.h = n_heads
-        self.dk = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.proj = nn.Linear(d_model, d_model, bias=False)
-
-    import json
-import math
-import random
-from pathlib import Path
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-
-from transformers import AutoTokenizer
-
-
-# -----------------------------
-# Data
-# -----------------------------
-class JsonlSFTDataset(Dataset):
-    def __init__(self, path, tokenizer, max_len=1024):
-        self.items = []
-        self.tok = tokenizer
-        self.max_len = max_len
-
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                prompt = obj["prompt"].strip()
-                output = obj["output"].strip()
-
-                # build causal LM training text
-                # You can change <assistant> token to something else if you like
-                text = f"{prompt}\n<assistant>\n{output}"
-                ids = self.tok(
-                    text,
-                    truncation=True,
-                    max_length=max_len,
-                    return_tensors=None,
-                    add_special_tokens=True,
-                )["input_ids"]
-                self.items.append(torch.tensor(ids, dtype=torch.long))
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        ids = self.items[idx]
-        return ids
-
-
-def pad_collate(batch, pad_id):
-    maxlen = max(x.size(0) for x in batch)
-    out = torch.full((len(batch), maxlen), pad_id, dtype=torch.long)
-    attn = torch.zeros((len(batch), maxlen), dtype=torch.bool)
-    for i, x in enumerate(batch):
-        out[i, : x.size(0)] = x
-        attn[i, : x.size(0)] = 1
-    labels = out.clone()
-    labels[~attn] = -100  # ignore padding in loss
-    return out, attn, labels
-
-
-# -----------------------------
-# MoE Blocks
-# -----------------------------
-class ExpertFFN(nn.Module):
+class DenseFFN(nn.Module):
     def __init__(self, d_model, d_ff):
         super().__init__()
-        # SwiGLU: project to 2*d_ff
-        self.fc1 = nn.Linear(d_model, 2 * d_ff, bias=False)
-        self.fc2 = nn.Linear(d_ff, d_model, bias=False)
-
+        self.fc1 = nn.Linear(d_model, d_ff, bias=False)   # 512 → 2048
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(d_ff, d_model, bias=False)   # 2048 → 512
     def forward(self, x):
-        a, b = self.fc1(x).chunk(2, dim=-1)
-        return self.fc2(F.silu(a) * b)
-
-
-class Top2Router(nn.Module):
-    def __init__(self, d_model, n_experts, noise_std=1e-2):
-        super().__init__()
-        self.proj = nn.Linear(d_model, n_experts, bias=False)
-        self.noise_std = noise_std
-        self.n_experts = n_experts
-
-    def forward(self, x, train=True):
-        # x: [B, T, H]
-        logits = self.proj(x)
-        if train and self.noise_std > 0:
-            logits = logits + torch.randn_like(logits) * self.noise_std
-        gate = F.softmax(logits, dim=-1)  # [B, T, E]
-        top2_val, top2_idx = torch.topk(gate, k=2, dim=-1)  # [B,T,2]
-        return top2_val, top2_idx, gate
-
-
-class MoEFFN(nn.Module):
-    """
-    Naive reference MoE: Top-2 with simple dispatch.
-    For speed at scale: use fused kernels (DeepSpeed-MoE / Tutel).
-    """
-    def __init__(self, d_model, d_ff, n_experts=8, capacity_factor=1.25):
-        super().__init__()
-        self.n_experts = n_experts
-        self.capacity_factor = capacity_factor
-        self.experts = nn.ModuleList([ExpertFFN(d_model, d_ff) for _ in range(n_experts)])
-        self.router = Top2Router(d_model, n_experts)
-
-    def forward(self, x, train=True):
-        B, T, H = x.shape
-        top2_val, top2_idx, gate = self.router(x, train=train)
-        tokens = B * T
-        cap = max(1, int(self.capacity_factor * (tokens * 2 / self.n_experts)))
-
-        y = torch.zeros_like(x)
-        # load balancing stats
-        prob_per_expert = gate.mean(dim=(0, 1))
-        used_per_expert = torch.zeros(self.n_experts, device=x.device)
-
-        flat_x = x.reshape(-1, H)
-        flat_y = y.reshape(-1, H)
-
-        for k in range(2):
-            idx = top2_idx[..., k].reshape(-1)        # [B*T]
-            val = top2_val[..., k].reshape(-1, 1)     # [B*T,1]
-
-            for e in range(self.n_experts):
-                mask = (idx == e)
-                if not mask.any():
-                    continue
-                sel = mask.nonzero(as_tuple=False).squeeze(-1)
-                # capacity clipping (naive)
-                take = min(sel.numel(), cap - int(used_per_expert[e].item()))
-                if take <= 0:
-                    continue
-                sel = sel[:take]
-                out = self.experts[e](flat_x.index_select(0, sel))
-                # weighted add
-                weighted = out * val.index_select(0, sel)
-                # scatter-add
-                flat_y.index_copy_(0, sel, flat_y.index_select(0, sel) + weighted)
-                used_per_expert[e] += take
-
-        y = flat_y.view(B, T, H)
-
-        # Switch-style load balancing aux
-        me = 1e-9
-        frac_used = used_per_expert.clamp_min(me) / (tokens * 2 + me)
-        balance_loss = (prob_per_expert * frac_used).sum() * self.n_experts
-
-        return y, balance_loss
+        return self.fc2(self.act(self.fc1(x)))
 
 
 # -----------------------------
@@ -360,11 +205,7 @@ class TransformerBlock(nn.Module):
         if self.use_moe:
             self.ff = MoEFFN(d_model, d_ff, n_experts=n_experts)
         else:
-            self.ff_dense = nn.Sequential(
-                nn.Linear(d_model, 2 * d_ff, bias=False),
-                nn.SiLU(),
-                nn.Linear(d_ff, d_model, bias=False),
-            )
+            self.ff_dense = DenseFFN(d_model, d_ff)
 
     def forward(self, x, train=True):
         x = x + self.attn(self.ln1(x))
@@ -478,7 +319,7 @@ class TransformerBlock(nn.Module):
             self.ff = MoEFFN(d_model, d_ff, n_experts=n_experts)
         else:
             self.ff_dense = nn.Sequential(
-                nn.Linear(d_model, 2 * d_ff, bias=False),
+                nn.Linear(d_model, d_ff, bias=False),
                 nn.SiLU(),
                 nn.Linear(d_ff, d_model, bias=False),
             )
