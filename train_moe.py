@@ -3,7 +3,7 @@ import math
 import random
 from pathlib import Path
 import wandb
-import tqdm
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
