@@ -3,6 +3,7 @@ import math
 import random
 from pathlib import Path
 import wandb
+import tqdm
 
 import torch
 import torch.nn as nn
@@ -289,22 +290,23 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         total, total_aux = 0.0, 0.0
-        for step, (inp, attn, labels) in enumerate(dl):
+
+        progress = tqdm(dl, desc=f"Epoch {epoch}", leave=True)
+
+        for step, (inp, attn, labels) in enumerate(progress):
             inp = inp.to(args.device)
             labels = labels.to(args.device)
 
             logits, bal_loss = model(inp, train=True)
-            # standard causal LM loss
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
-            total_aux += float(bal_loss.item())
-            # add small load balancing loss
-            loss = loss + 0.03 * bal_loss
-            wandb.log({
-                "loss": float(loss.item()),
-                "aux_loss": float(bal_loss.item()),
-                "epoch": epoch,
-            })
 
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100
+            )
+
+            total_aux += float(bal_loss.item())
+            loss = loss + 0.03 * bal_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -313,14 +315,17 @@ def main():
 
             total += float(loss.item())
 
-            if step % 50 == 0:
-                print(f"epoch {epoch} step {step} loss {total/(step+1):.4f} aux {total_aux/(step+1):.4f}")
+            # update tqdm bar description
+            progress.set_postfix({
+                "loss": f"{total/(step+1):.4f}",
+                "aux": f"{total_aux/(step+1):.4f}"
+            })
 
-        # save tiny checkpoint
         ckpt = f"tiny_moe_epoch{epoch}.pt"
         torch.save({"model": model.state_dict(),
                     "tokenizer": tokenizer.name_or_path}, ckpt)
         print(f"saved {ckpt}")
+
 
 
 if __name__ == "__main__":
