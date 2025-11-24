@@ -2,6 +2,7 @@ import json
 import math
 import random
 from pathlib import Path
+import wandb
 
 import torch
 import torch.nn as nn
@@ -259,6 +260,19 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    wandb.init(
+        project="moe-datasci",
+        config={
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "max_len": args.max_len,
+            "model_dim": 512,
+            "num_experts": 8,
+         }
+    )
+
+
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -285,6 +299,12 @@ def main():
             total_aux += float(bal_loss.item())
             # add small load balancing loss
             loss = loss + 0.03 * bal_loss
+            wandb.log({
+                "loss": float(loss.item()),
+                "aux_loss": float(bal_loss.item()),
+                "epoch": epoch,
+            })
+
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
