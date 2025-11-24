@@ -307,6 +307,12 @@ def main():
 
             total_aux += float(bal_loss.item())
             loss = loss + 0.03 * bal_loss
+            
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/aux_loss": bal_loss.item(),
+                "train/step": epoch * len(dl) + step,
+            })
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -330,3 +336,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
